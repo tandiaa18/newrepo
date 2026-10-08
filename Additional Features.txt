@@ -1,0 +1,479 @@
+
+Rollback Strategy
+******************************************************
+1) Rollback strategy — overview
+
+Goal: be able to quickly revert to a known-good revision/manifest with minimal downtime.
+
+General strategy:
+
+Keep previous artifacts (container images) and previous cluster/service revisions.
+
+Use traffic-splitting (Cloud Run) or kubectl rollout undo (GKE) to revert.
+
+Use Cloud Deploy for progressive staged rollouts and automatic/manual rollback on failures.
+
+Add deployment health checks and automated alerts so rollback happens fast when needed.
+
+
+
+
+Keep previous revisions in Cloud Run
+******************************************************
+2) Keep previous revisions in Cloud Run
+
+Cloud Run automatically creates a revision for each deploy. To be able to rollback:
+
+Steps:
+
+Do not delete revisions automatically. Don’t enable any process that prunes revisions unless intentional.
+
+List revisions:
+
+gcloud run revisions list --service my-app --region us-central1
+
+
+Rollback by re-routing traffic to an earlier revision:
+
+Get the revision name from the list, then:
+
+gcloud run services update-traffic my-app \
+  --to-revisions REVISION_NAME=1 \
+  --region us-central1
+
+
+Or use the Console -> Cloud Run -> Service -> Revisions -> Split traffic to the older revision.
+
+Keep images in Artifact Registry with immutable tags (e.g. us-central1-docker.pkg.dev/PROJECT/my-repo/my-app:sha-abcdef) so you can re-deploy a specific image if needed:
+
+gcloud artifacts docker images list us-central1-docker.pkg.dev/PROJECT/my-repo
+gcloud run deploy my-app --image us-central1-docker.pkg.dev/PROJECT/my-repo/my-app:sha-abcdef --region us-central1
+
+
+Tip: use semantic image tags plus immutable SHA tags; never overwrite latest for production images.
+
+GKE uses Deployment rollbacks
+******************************************************
+3) GKE — Deployment rollbacks
+
+Kubernetes has built-in rollout history and rollback.
+
+Steps:
+
+Ensure your Deployments keep revision history (default revisionHistoryLimit is 10; increase if desired):
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  revisionHistoryLimit: 20   # optional: keep more revisions
+  ...
+
+
+Deploy new version (usual kubectl apply -f k8s/deployment.yaml).
+
+Check rollout status:
+
+kubectl rollout status deployment/my-app -n my-namespace
+
+
+View rollout history:
+
+kubectl rollout history deployment/my-app -n my-namespace
+
+
+Rollback to previous revision:
+
+To previous:
+
+kubectl rollout undo deployment/my-app -n my-namespace
+
+
+To a specific revision:
+
+kubectl rollout undo deployment/my-app --to-revision=3 -n my-namespace
+
+
+Automate health checks: set readinessProbe and livenessProbe in the deployment; configure Horizontal Pod Autoscaler if needed.
+
+Tip: combine kubectl rollout pause / resume for safer multi-step updates.
+
+
+Cloud Deploy supports rollback on failed rollout
+******************************************************
+4) Cloud Deploy — support for rollback on failed rollout
+
+Cloud Deploy provides staged delivery (staging → approval → prod) and can automatically rollback.
+
+Quick steps:
+
+Enable API and create a Delivery Pipeline with targets (staging/prod).
+
+Create a release from your image built by Cloud Build.
+
+Cloud Deploy automatically handles failed rollouts by stopping and enabling rollback; you can also manually roll back.
+
+Common commands (conceptual — substitute your pipeline/target names):
+
+# Create a release (example)
+gcloud deploy releases create RELEASE_ID \
+  --delivery-pipeline=PIPELINE_ID \
+  --images=my-app=us-central1-docker.pkg.dev/PROJECT/my-repo/my-app:sha-abcdef
+
+# Promote to a target (optional manual promotion)
+gcloud deploy releases promote RELEASE_ID --delivery-pipeline=PIPELINE_ID --region=us-central1 --target=prod
+
+
+To rollback:
+
+Use the Console or gcloud deploy to reject/promote a previous release, or Cloud Deploy will perform automatic rollback when configured health checks fail. Use the Console Releases page to inspect and rollback to a previous release.
+
+Tip: Add health checks and verification steps to each target so Cloud Deploy can detect a bad release and revert automatically.
+
+
+Security
+******************************************************
+5) Security — Workload Identity for GKE
+
+Workload Identity allows Kubernetes Service Accounts (KSAs) to impersonate Google Service Accounts (GSAs) securely.
+
+Steps:
+
+Enable Workload Identity on the cluster (when creating the cluster):
+
+gcloud container clusters create my-cluster \
+  --workload-pool=PROJECT_ID.svc.id.goog \
+  --zone us-central1-a
+
+
+Or enable it on an existing cluster with the gcloud cluster update command (or use Console).
+
+Create a Google Service Account (GSA):
+
+gcloud iam service-accounts create my-gsa --display-name="my app GSA"
+
+
+Grant the GSA needed IAM roles (least privilege). Example:
+
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member="serviceAccount:my-gsa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/storage.objectViewer"
+
+
+Create a Kubernetes service account (KSA) in the namespace:
+
+kubectl create serviceaccount my-ksa -n my-namespace
+
+
+Allow KSA to impersonate GSA by binding the GSA to the KSA:
+
+gcloud iam service-accounts add-iam-policy-binding \
+  my-gsa@PROJECT_ID.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:PROJECT_ID.svc.id.goog[my-namespace/my-ksa]"
+
+
+Annotate the KSA to reference the GSA:
+
+kubectl annotate serviceaccount \
+  --namespace my-namespace \
+  my-ksa \
+  iam.gke.io/gcp-service-account=my-gsa@PROJECT_ID.iam.gserviceaccount.com
+
+
+Run pods using the KSA (in deployment YAML serviceAccountName: my-ksa). Pods will use the GSA identity automatically.
+
+Tip: grant GSA only the specific roles required by the workload (least-privilege). Use separate GSAs per app or microservice.
+
+
+
+******************************************************
+5) Security — Workload Identity for GKE
+
+Workload Identity allows Kubernetes Service Accounts (KSAs) to impersonate Google Service Accounts (GSAs) securely.
+
+Steps:
+
+Enable Workload Identity on the cluster (when creating the cluster):
+
+gcloud container clusters create my-cluster \
+  --workload-pool=PROJECT_ID.svc.id.goog \
+  --zone us-central1-a
+
+
+Or enable it on an existing cluster with the gcloud cluster update command (or use Console).
+
+Create a Google Service Account (GSA):
+
+gcloud iam service-accounts create my-gsa --display-name="my app GSA"
+
+
+Grant the GSA needed IAM roles (least privilege). Example:
+
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member="serviceAccount:my-gsa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/storage.objectViewer"
+
+
+Create a Kubernetes service account (KSA) in the namespace:
+
+kubectl create serviceaccount my-ksa -n my-namespace
+
+
+Allow KSA to impersonate GSA by binding the GSA to the KSA:
+
+gcloud iam service-accounts add-iam-policy-binding \
+  my-gsa@PROJECT_ID.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:PROJECT_ID.svc.id.goog[my-namespace/my-ksa]"
+
+
+Annotate the KSA to reference the GSA:
+
+kubectl annotate serviceaccount \
+  --namespace my-namespace \
+  my-ksa \
+  iam.gke.io/gcp-service-account=my-gsa@PROJECT_ID.iam.gserviceaccount.com
+
+
+Run pods using the KSA (in deployment YAML serviceAccountName: my-ksa). Pods will use the GSA identity automatically.
+
+Tip: grant GSA only the specific roles required by the workload (least-privilege). Use separate GSAs per app or microservice.
+
+Cloud KMS to store secrets
+******************************************************
+6) Security — Cloud KMS to store/seal secrets
+
+Two common models:
+
+Use Secret Manager with customer-managed encryption keys (CMEK) backed by Cloud KMS (recommended).
+
+Or directly encrypt/decrypt secrets with Cloud KMS (less convenient).
+
+A) Recommended: Secret Manager + KMS (CMEK)
+
+Enable APIs: secretmanager.googleapis.com and cloudkms.googleapis.com.
+
+Create a KMS key ring + key:
+
+gcloud kms keyrings create my-keyring --location=global
+gcloud kms keys create my-key --location=global --keyring=my-keyring --purpose=encryption
+
+
+Create a Secret in Secret Manager using that CMEK:
+
+gcloud secrets create my-secret \
+  --replication-policy="automatic" \
+  --locations="us" \
+  --kms-key-name="projects/PROJECT_ID/locations/global/keyRings/my-keyring/cryptoKeys/my-key"
+
+
+Add a secret version (the value):
+
+echo -n "super-secret-value" | gcloud secrets versions add my-secret --data-file=-
+
+
+Grant access to services (e.g., GSA used by Cloud Run or GKE) to roles/secretmanager.secretAccessor:
+
+gcloud secrets add-iam-policy-binding my-secret \
+  --member="serviceAccount:my-gsa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+
+Consume secrets:
+
+Cloud Run: set secret environment variables referencing Secret Manager.
+
+GKE: use Secret Manager CSI driver or fetch at startup with the GSA credentials.
+
+B) Direct KMS encrypt/decrypt (if you must)
+
+Encrypt a file with KMS:
+
+gcloud kms encrypt \
+  --location=global \
+  --keyring=my-keyring \
+  --key=my-key \
+  --plaintext-file=plain.txt \
+  --ciphertext-file=encrypted.bin
+
+
+Decrypt:
+
+gcloud kms decrypt \
+  --location=global \
+  --keyring=my-keyring \
+  --key=my-key \
+  --ciphertext-file=encrypted.bin \
+  --plaintext-file=plain-decrypted.txt
+
+
+But prefer Secret Manager because of rotation, IAM, and versioning features.
+
+
+Cloud IAM for least-privilege roles
+******************************************************
+7) Security — Cloud IAM for least-privilege roles
+
+Steps to implement least privilege:
+
+Inventory what each service needs (read/write to buckets, pub/sub publish, etc.).
+
+Create dedicated GSAs per service (don’t reuse a single broad service account).
+
+Grant narrow roles (prefer predefined least-privilege roles or custom roles if necessary).
+
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member="serviceAccount:my-gsa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/pubsub.publisher"
+
+
+Use IAM Conditions where possible to limit role scope (e.g., time-bound, resource-bound).
+
+Use Organization policies and VPC Service Controls for highly sensitive data.
+
+Audit via Cloud Audit Logs regularly and remove unused permissions.
+
+Tip: use IAM Recommender and Access Transparency (where available) to identify over-privileged accounts.
+
+
+Observability
+******************************************************
+8) Observability — Cloud Logging (formerly Stackdriver)
+
+Steps:
+
+Enable the Cloud Logging API.
+
+Applications:
+
+For Cloud Run: logs written to stdout/stderr are automatically captured.
+
+For GKE: use Cloud Operations for GKE (Ops Agent or sidecars) — ensure logs are forwarded.
+
+Query logs in Cloud Console: Logging → Logs Explorer.
+
+Create log-based metrics to trigger alerts:
+
+Example: count 5xx responses in 5 minutes → create alerting policy.
+
+Set sink to export logs to BigQuery or Cloud Storage for long-term storage:
+
+gcloud logging sinks create my-sink bigquery.googleapis.com/projects/PROJECT/datasets/DATASET \
+  --log-filter='resource.type="cloud_run_revision" AND severity>=ERROR'
+
+
+Cloud Monitoring
+******************************************************
+9) Observability — Cloud Monitoring
+
+Steps:
+
+Enable Cloud Monitoring API.
+
+Automatically: Cloud Run and GKE provide built-in metrics.
+
+Create uptime checks and alerting policies:
+
+Uptime checks to endpoint → create alert for sustained failure.
+
+Dashboards: build a monitoring dashboard for key metrics (latency, error rate, CPU, memory).
+
+SLOs/SLA: define SLOs using Monitoring SLO feature (error budget tracking).
+
+Integrate with PagerDuty / Slack via notification channels for alerts.
+
+Example: create an alert for high error rate in Console → Monitoring → Alerting → Create Policy.
+
+
+Error Reporting
+******************************************************
+10) Observability — Error Reporting
+
+Steps:
+
+Enable Error Reporting API.
+
+Instrument apps:
+
+For supported runtimes, errors sent to stderr and the runtime integration will surface errors in Error Reporting automatically (Cloud Run/GKE).
+
+For custom use, call Error Reporting API client libraries to report exceptions.
+
+View & group errors in Console → Error Reporting.
+
+Create alerting policies for new/frequent/exploding errors.
+
+Example (Node.js): use the @google-cloud/error-reporting client library to report caught exceptions.
+
+
+***************************************************************************************************************************************************
+Cloud Trace
+
+11) Observability — Cloud Trace
+Steps:
+
+
+Enable Cloud Trace API.
+
+
+Add auto-instrumentation or libraries:
+
+
+For Java, Node, Python, Go — use OpenTelemetry or the Cloud Trace client libraries / agents.
+
+
+For App Engine / Cloud Run, add the language-specific trace library and initialize.
+
+
+
+
+Send traces from your app so you can view latency breakdowns and span details in Trace UI.
+
+
+Create latency SLOs and dashboards in Monitoring using trace-based or metric-based latency measurements.
+
+
+Quick example (Node.js with OpenTelemetry):
+
+
+Install OpenTelemetry SDK and exporter for Google Cloud, initialize at app startup so traces are captured automatically.
+
+********************************************************************************************************************************
+
+12) Putting it all together — sample checklist for deploys
+Before deploy to prod:
+
+
+Build image with immutable SHA and push to Artifact Registry.
+
+
+Run CI tests and container vulnerability scan.
+
+
+Create release in Cloud Deploy (or deploy to staging).
+
+
+Run smoke tests and synthetic monitoring checks.
+
+
+If healthy, promote to prod with staged traffic (Cloud Run) or rolling update (GKE).
+
+
+Monitor logs, metrics, traces, and error reporting for anomalies during/after rollout.
+
+
+If anomaly → trigger rollback:
+
+
+Cloud Run: route traffic back to previous revision.
+
+
+GKE: kubectl rollout undo.
+
+
+Cloud Deploy: revert to previous release or let Cloud Deploy rollback automatically.
+
+
+
